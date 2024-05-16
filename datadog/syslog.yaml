@@ -1,0 +1,6 @@
+logs:
+  - type: udp
+    port: 514
+    service: "node-app"
+    source: syslog
+

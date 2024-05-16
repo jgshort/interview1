@@ -1,0 +1,16 @@
+{
+  "name": "SampleChaosMonkey",
+  "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": {
+    "name": "Jason Short",
+    "email": "53501+jgshort@users.noreply.github.com"
+  },
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "engines": {
+    "node": ">= 20"
+  }
+}

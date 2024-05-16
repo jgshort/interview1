@@ -1,0 +1,27 @@
+{
+  "name": "Sample",
+  "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": {
+    "name": "Jason Short",
+    "email": "53501+jgshort@users.noreply.github.com"
+  },
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "engines": {
+    "node": ">= 20"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/instrumentation": "^0.50.0",
+    "@opentelemetry/instrumentation-express": "^0.37.0",
+    "@opentelemetry/instrumentation-http": "^0.50.0",
+    "dd-trace": "^5.10.0",
+    "express": "^4.19.2",
+    "hot-shots": "^10.0.0",
+    "winston": "^3.13.0",
+    "winston-syslog": "^2.7.0"
+  }
+}

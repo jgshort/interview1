@@ -1,0 +1,326 @@
+name: Deploy the API Sample
+
+# Turning off automatic workflow execution:
+# on: [push]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  infrastructure:
+    defaults:
+      run:
+        working-directory: terraform/infrastructure
+    outputs:
+      domain: ${{ steps.railway_domain.outputs.domain }}
+      environment_id: ${{ steps.railway_project_token.outputs.environment_id }}
+      project_id: ${{ steps.terraform_output.outputs.project_id }}
+      project_token: ${{ steps.railway_project_token.outputs.project_token }}
+      service_ids: ${{ steps.railway_service_ids.outputs.service_ids }}
+      dd_service_id: ${{ steps.terraform_output.outputs.dd_service_id }}
+      chaos_id: ${{ steps.terraform_output.outputs.chaos_id }}
+    name: Validate, Plan, and Apply Railway Terraform.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.1"
+          terraform_wrapper: false
+      - name: Validate
+        run: terraform fmt -check -diff -recursive
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/SampleTerraformBranchRole
+      - name: Initialize
+        run: terraform init -input='false'
+      - name: Create Workspace
+        # In the real world, the workspace would be configurable.
+        # I'm hard-coding it to 'dev' for this exercise.
+        run: terraform workspace new dev
+        continue-on-error: true
+      - name: Utilize Workspace
+        run: terraform workspace select dev
+        continue-on-error: true
+      - name: Validate
+        run: terraform validate
+      - name: Pull Resources
+        run: terraform get
+      - name: Plan
+        id: terraform_plan
+        run: |
+          terraform plan -no-color \
+            -var-file=dev.tfvars \
+            -var "load_balancer_name=${{ secrets.CLOUDFLARE_LOAD_BALANCER_NAME }}" \
+            -var "railway_token=${{ secrets.RAILWAY_TOKEN }}" \
+            -var "datadog_api_key=${{ secrets.DD_API_KEY }}" \
+            -var "datadog_app_key=${{ secrets.DD_APP_KEY }}" \
+            -out=terraform.plan
+      - name: Apply
+        id: terraform_apply
+        run: terraform apply terraform.plan
+      - name: Output
+        id: terraform_output
+        run: |
+          echo "project_id=$(terraform output -raw project_id)" >> "$GITHUB_OUTPUT"
+          echo "chaos_id=$(terraform output -raw chaos_id)" >> "$GITHUB_OUTPUT"
+          echo "dd_service_id=$(terraform output -raw dd_service_id)" >> "$GITHUB_OUTPUT"
+          echo "chaos_id=$(terraform output -raw chaos_id)" >> "$GITHUB_OUTPUT"
+      - name: Create Project Token
+        id: railway_project_token
+        run: |
+          echo "Project Id: ${{ steps.terraform_output.outputs.project_id }}"
+          environmentId=$(curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "query me { me { projects { edges { node { environments { edges { node { id name } } } } } } } } "}' | jq -r '.data.me.projects.edges | .[] | .node.environments.edges | .[] | .node.id')
+          projectToken=$(curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{ "query": "mutation { projectTokenCreate(input: { name: \"CiCdProjectToken\", environmentId: \"'"$environmentId"'\", projectId: \"${{ steps.terraform_output.outputs.project_id }}\" }) }"} ' | jq -r '.data.projectTokenCreate' )
+          echo "Project Token: $projectToken"
+          echo "Environment: $environmentId"
+          echo "project_token=$projectToken" >> "$GITHUB_OUTPUT"
+          echo "environment_id=$environmentId" >> "$GITHUB_OUTPUT"
+      - name: Acquire Service Ids
+        id: railway_service_ids
+        run: |
+          serviceIds=$(curl -s --request POST \
+              --url https://backboard.railway.app/graphql/v2 \
+              --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+              --header "Content-Type: application/json" \
+              --data '{"query": "query me { me { projects { edges { node { services { edges { node { id name } } } } } } } } "}' | jq -r '.data.me.projects.edges | .[] | .node.services.edges | map(select(any(.node.name; contains("API"))) | .node.id)')
+          echo "$serviceIds"
+          echo 'service_ids<<EOF' >> $GITHUB_OUTPUT
+          echo "$serviceIds" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+      - name: Check Service Ids
+        run: |
+          jq . <<< '${{ steps.railway_service_ids.outputs.service_ids }}'
+
+  datadog:
+    needs: [infrastructure]
+    defaults:
+      run:
+        working-directory: datadog
+    runs-on: ubuntu-latest
+    name: Deploy Datadog
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Yarn
+        run: yarn install --frozen-lockfile
+      - name: Install Railway
+        run: npm i -g @railway/cli
+      - name: Link Datadog
+        run: railway link --environment=dev ${{ needs.infrastructure.outputs.project_id }} ${{ needs.infrastructure.outputs.dd_service_id }}
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Link Service
+        run: railway service  ${{ needs.infrastructure.outputs.dd_service_id }}
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Deploy Datadog
+        run: railway up -d
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+
+  railway:
+    needs: [infrastructure, datadog]
+    strategy:
+      matrix:
+        service_id: ${{ fromJson(needs.infrastructure.outputs.service_ids) }}
+      fail-fast: false
+      max-parallel: 2
+    defaults:
+      run:
+        working-directory: app
+    name: Deploy Service.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Yarn
+        run: yarn install --frozen-lockfile
+      - name: Install Railway and Gyp
+        run: |
+          npm i -g @railway/cli
+          npm i -g node-gyp
+      - name: Upsert Environment Variables
+        run: |
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ matrix.service_id }}\", name: \"DD_DOGSTATSD_PORT\", value: \"8125\" }) }"}'
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ matrix.service_id }}\", name: \"DD_AGENT_SYSLOG_PORT\", value: \"8125\" }) }"}'
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ matrix.service_id }}\", name: \"DD_DOGSTATSD_HOSTNAME\", value: \"${{'${{Datadog.DD_HOSTNAME}}'}}\" }) }"}'
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ matrix.service_id }}\", name: \"DD_TRACE_AGENT_HOSTNAME\", value: \"${{'${{Datadog.DD_HOSTNAME}}'}}\" }) }"}'
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ matrix.service_id }}\", name: \"DD_TRACE_AGENT_PORT\", value: \"8126\" }) }"}'
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ matrix.service_id }}\", name: \"DD_TRACE_AGENT_URL\", value: \"http://${{'${{Datadog.DD_HOSTNAME}}'}}:8126\" }) }"}'
+      - name: Upsert Datadog Variables
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_SITE: us5.datadoghq.com
+        run: |
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ needs.infrastructure.outputs.dd_service_id }}\", name: \"DD_API_KEY\", value: \"'" $DD_API_KEY "'\" }) }"}'
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ needs.infrastructure.outputs.dd_service_id }}\", name: \"DD_SITE\", value: \"'" $DD_SITE "'\" }) }"}'
+      - name: Link Railway Service
+        run: railway link --environment=dev ${{ needs.infrastructure.outputs.project_id }} ${{ matrix.service_id }}
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Deploy Railway Service
+        run: railway up
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Generate Domains
+        id: railway_domain
+        run: |
+          domain=$(curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${RAILWAY_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { serviceDomainCreate(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", serviceId: \"${{ matrix.service_id }}\" }){ domain } }"}' | jq -r '.data.serviceDomainCreate.domain')
+          echo "Railway Domain: $domain"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  cloudflare:
+    needs: railway
+    defaults:
+      run:
+        working-directory: terraform/lb
+    name: Deploy Cloudflare Load Balancer.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.1"
+          terraform_wrapper: false
+      - name: Gather Service Domains
+        id: railway_domains
+        run: |
+          domains=$(curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "query me { me { projects { edges { node { services{ edges { node { id, serviceInstances { edges { node { id, domains { serviceDomains { domain } } } } } } } } } } } } }"}' | jq -r '.data.me.projects.edges[].node.services[] | .[].node.serviceInstances | .edges[].node.domains | .serviceDomains[].domain' | jq -Rn '[inputs]')
+          echo "Railway Service Domains: $domains"
+          echo 'domains<<EOF' >> $GITHUB_OUTPUT
+          echo "$domains" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+      - name: Validate
+        run: terraform fmt -check -diff -recursive
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/SampleTerraformBranchRole
+      - name: Initialize
+        run: terraform init -input='false'
+      - name: Create Workspace
+        run: terraform workspace new dev
+        continue-on-error: true
+      - name: Utilize Workspace
+        run: terraform workspace select dev
+        continue-on-error: true
+      - name: Validate
+        run: terraform validate
+      - name: Pull Resources
+        run: terraform get
+      - name: Plan
+        env:
+          RAILWAY_DOMAINS: ${{ steps.railway_domains.outputs.domains }}
+        id: terraform_plan
+        run: |
+          printf 'railway_domains = %s\n' "$RAILWAY_DOMAINS" > railway_domains.tfvars
+          cat railway_domains.tfvars
+          terraform plan -no-color \
+            -var-file=railway_domains.tfvars \
+            -var "environment=dev" \
+            -var "load_balancer_name=${{ secrets.CLOUDFLARE_LOAD_BALANCER_NAME }}" \
+            -var "cloudflare_api_token=${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -var "cloudflare_account_id=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" \
+            -var "cloudflare_zone_id=${{ secrets.CLOUDFLARE_ZONE_ID }}" \
+            -out=terraform.plan
+      - name: Apply
+        id: terraform_apply
+        run: terraform apply terraform.plan
+
+  chaos-monkey:
+    needs: [infrastructure, cloudflare, datadog]
+    defaults:
+      run:
+        working-directory: chaos
+    name: Unleash the Chaos Monkey
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Yarn
+        run: yarn install --frozen-lockfile
+      - name: Install Railway
+        run: npm i -g @railway/cli
+      - name: Link Chaos Monkey
+        run: railway link --environment=dev ${{ needs.infrastructure.outputs.project_id }} ${{ needs.infrastructure.outputs.chaos_id }}
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Link Service
+        run: railway service  ${{ needs.infrastructure.outputs.chaos_id }}
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Deploy Chaos Monkey
+        run: railway up -d
+        env:
+          RAILWAY_TOKEN: ${{ needs.infrastructure.outputs.project_token }}
+      - name: Create Chaos Monkey Token
+        run: |
+          curl -s --request POST \
+            --url https://backboard.railway.app/graphql/v2 \
+            --header "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "mutation { variableUpsert(input: { environmentId: \"${{ needs.infrastructure.outputs.environment_id }}\", projectId: \"${{ needs.infrastructure.outputs.project_id }}\", serviceId: \"${{ needs.infrastructure.outputs.chaos_id }}\", name: \"TOKEN_OF_CHAOS\", value: \"${{secrets.RAILWAY_TOKEN}}\" }) }"}'
+
